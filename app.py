@@ -45,7 +45,8 @@ class LexiconEntry:
 @dataclass(frozen=True)
 class LexiconStore:
     entries: List[LexiconEntry]
-    token_index: Dict[str, List[int]]
+    normalized_terms: List[str]
+    term_tokens: List[set[str]]
 
 
 def normalize_base_url(base_url: str) -> str:
@@ -94,34 +95,56 @@ def load_finance_lexicon() -> LexiconStore | None:
 
 
 def build_lexicon_store(entries: List[LexiconEntry]) -> LexiconStore:
-    token_index: Dict[str, List[int]] = {}
-    for idx, entry in enumerate(entries):
-        for token in tokenize(entry.term):
-            token_index.setdefault(token, []).append(idx)
-    return LexiconStore(entries=entries, token_index=token_index)
+    normalized_terms: List[str] = []
+    term_tokens: List[set[str]] = []
+    for entry in entries:
+        normalized = normalize_phrase(entry.term)
+        normalized_terms.append(normalized)
+        term_tokens.append(tokens_with_stems(normalized))
+    return LexiconStore(entries=entries, normalized_terms=normalized_terms, term_tokens=term_tokens)
 
 
-def tokenize(text: str) -> List[str]:
-    return re.findall(r"[A-Za-zÀ-ÿ0-9]+", text.lower())
+def normalize_phrase(text: str) -> str:
+    cleaned = re.sub(r"\[\[\[RUN_(?:\d+|END)\]\]\]", " ", text)
+    cleaned = re.sub(r"[^A-Za-zÀ-ÿ0-9]+", " ", cleaned.lower())
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
-def build_rag_context(texts: Iterable[str], lexicon: LexiconStore, max_entries: int = 30) -> str:
-    combined_text = re.sub(r"\[\[\[RUN_(?:\d+|END)\]\]\]", " ", " ".join(texts)).lower()
-    doc_tokens = set(tokenize(combined_text))
-    scores: Dict[int, int] = {}
-    for token in doc_tokens:
-        for idx in lexicon.token_index.get(token, []):
-            scores[idx] = scores.get(idx, 0) + 1
+def stem_token(token: str) -> str:
+    for suffix in ("ing", "ed", "es", "s"):
+        if token.endswith(suffix) and len(token) > len(suffix) + 2:
+            return token[: -len(suffix)]
+    return token
+
+
+def tokens_with_stems(normalized_text: str) -> set[str]:
+    if not normalized_text:
+        return set()
+    tokens = normalized_text.split()
+    stems = {stem_token(token) for token in tokens}
+    return set(tokens) | stems
+
+def build_rag_context(texts: Iterable[str], lexicon: LexiconStore) -> str:
+    normalized_text = normalize_phrase(" ".join(texts))
+    doc_tokens = tokens_with_stems(normalized_text)
+
+    matched_indices: List[int] = []
     for idx, entry in enumerate(lexicon.entries):
-        if entry.term.lower() in combined_text:
-            scores[idx] = scores.get(idx, 0) + 5
+        term_norm = lexicon.normalized_terms[idx]
+        if not term_norm:
+            continue
+        if term_norm in normalized_text:
+            matched_indices.append(idx)
+            continue
+        term_tokens = lexicon.term_tokens[idx]
+        if term_tokens and term_tokens.issubset(doc_tokens):
+            matched_indices.append(idx)
 
-    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-    selected = [lexicon.entries[idx] for idx, _ in ranked[:max_entries]]
-    if not selected:
+    if not matched_indices:
         return ""
     lines = []
-    for entry in selected:
+    for idx in matched_indices:
+        entry = lexicon.entries[idx]
         if entry.translation:
             lines.append(f"- {entry.term} => {entry.translation}")
         else:
