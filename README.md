@@ -22,7 +22,7 @@ streamlit run app.py
 - PPTX charts and SmartArt text are translated by editing OOXML after save.
 - Some embedded objects (OLE/math) remain unchanged.
 - Provide your API key in the sidebar before translating.
-- Image text translation requires a vision-capable model; text-only models skip image processing.
+- Image text translation uses OCR (Pillow + pytesseract) and requires Tesseract to be installed locally.
 
 ## Finance lexicon RAG (required)
 

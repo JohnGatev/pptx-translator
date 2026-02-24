@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import base64
 from io import BytesIO
 from pathlib import Path
 import json
@@ -26,7 +25,7 @@ DEFAULT_TEMPERATURE = 0.2
 DEFAULT_TIMEOUT = 120
 LEXICON_PDF_NAME = "Finance 1 Lexicon ENG NL.pdf"
 FUZZY_MATCH_THRESHOLD = 88
-VISION_IMAGE_ENABLED = True
+OCR_IMAGE_ENABLED = True
 
 
 
@@ -866,33 +865,35 @@ def translate_xml_text_nodes(
     return output.getvalue()
 
 
-def supports_vision_model(model: str) -> bool:
-    model_name = model.lower()
-    vision_hints = ("vision", "gpt-4o", "gpt-4.1", "gpt-4-turbo")
-    return any(hint in model_name for hint in vision_hints)
-
-
-def extract_text_from_image(image_bytes: bytes, config: TranslationConfig) -> str:
-    if not VISION_IMAGE_ENABLED:
-        return ""
-    if not supports_vision_model(config.model):
-        return ""
-    encoded = base64.b64encode(image_bytes).decode("utf-8")
-    system_prompt = (
-        "You read text from images. Extract all visible text exactly as it appears, "
-        "preserving line breaks. Return only the extracted text."
-    )
-    user_content = [
-        {"type": "text", "text": "Extract the text exactly as shown."},
-        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}},
-    ]
+def check_ocr_dependencies() -> str | None:
     try:
-        return request_chat_completion(
-            [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}],
-            config,
-        )
+        import pytesseract  # noqa: F401
+        from PIL import Image  # noqa: F401
+    except Exception:
+        return "OCR dependencies are missing. Install pillow and pytesseract, and ensure Tesseract is installed."
+    return None
+
+
+def extract_text_from_image_ocr(image_bytes: bytes) -> str:
+    if not OCR_IMAGE_ENABLED:
+        return ""
+    try:
+        from PIL import Image, ImageOps
+        import pytesseract
     except Exception:
         return ""
+
+    try:
+        image = Image.open(BytesIO(image_bytes))
+    except Exception:
+        return ""
+    try:
+        image = ImageOps.exif_transpose(image)
+        image = ImageOps.grayscale(image)
+    except Exception:
+        pass
+    text = pytesseract.image_to_string(image)
+    return text.strip()
 
 
 def replace_picture_with_textbox(slide, shape, text: str) -> None:
@@ -923,12 +924,12 @@ def translate_image_shapes(
     lexicon: LexiconStore | None = None,
     tracker: ProgressTracker | None = None,
 ) -> None:
-    if not VISION_IMAGE_ENABLED or not supports_vision_model(config.model):
+    if not OCR_IMAGE_ENABLED:
         return
     for slide in presentation.slides:
         shapes = [shape for shape in iter_slide_shapes(slide.shapes) if shape.shape_type == MSO_SHAPE_TYPE.PICTURE]
         for shape in shapes:
-            extracted = extract_text_from_image(shape.image.blob, config)
+            extracted = extract_text_from_image_ocr(shape.image.blob)
             if extracted.strip():
                 glossary = select_lexicon_matches(extracted, lexicon) if lexicon else None
                 rag_context = format_lexicon_context(glossary) if glossary else None
@@ -1136,8 +1137,13 @@ def main() -> None:
 
             xml_count = count_xml_parts(raw_bytes)
             raw_image_count = count_picture_shapes(presentation)
-            use_vision = VISION_IMAGE_ENABLED and supports_vision_model(config.model)
-            image_count = raw_image_count if use_vision else 0
+            ocr_error = None
+            if OCR_IMAGE_ENABLED and raw_image_count:
+                ocr_error = check_ocr_dependencies()
+                if ocr_error:
+                    set_status(st.empty(), ocr_error)
+                    return
+            image_count = raw_image_count if OCR_IMAGE_ENABLED else 0
             total_steps = len(paragraphs) + xml_count + image_count
             if total_steps == 0:
                 total_steps = 1
