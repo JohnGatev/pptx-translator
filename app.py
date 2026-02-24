@@ -26,6 +26,7 @@ DEFAULT_TIMEOUT = 120
 LEXICON_PDF_NAME = "Finance 1 Lexicon ENG NL.pdf"
 FUZZY_MATCH_THRESHOLD = 88
 OCR_IMAGE_ENABLED = True
+LINE_BREAK_TOKEN = "[[[BR]]]"
 
 
 
@@ -109,7 +110,7 @@ def build_lexicon_store(entries: List[LexiconEntry]) -> LexiconStore:
 
 
 def normalize_phrase(text: str) -> str:
-    cleaned = re.sub(r"\[\[\[RUN_(?:\d+|END)\]\]\]", " ", text)
+    cleaned = re.sub(r"\[\[\[(?:RUN_(?:\d+|END)|BR)\]\]\]", " ", text)
     cleaned = re.sub(r"[^A-Za-zÀ-ÿ0-9]+", " ", cleaned.lower())
     return re.sub(r"\s+", " ", cleaned).strip()
 
@@ -127,6 +128,19 @@ def tokens_with_stems(normalized_text: str) -> set[str]:
     tokens = normalized_text.split()
     stems = {stem_token(token) for token in tokens}
     return set(tokens) | stems
+
+def encode_line_breaks(text: str) -> str:
+    if not text:
+        return text
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    return normalized.replace("\n", LINE_BREAK_TOKEN)
+
+
+def decode_line_breaks(text: str) -> str:
+    if not text:
+        return text
+    return text.replace(LINE_BREAK_TOKEN, "\n")
+
 
 def fuzzy_token_match(term_tokens: set[str], doc_tokens: Sequence[str], threshold: int) -> bool:
     if not term_tokens or not doc_tokens:
@@ -207,6 +221,27 @@ def rag_instructions(rag_context: str | None) -> str:
     )
 
 
+def strip_glossary_spillover(text: str) -> str:
+    if not text:
+        return text
+    cleaned_lines = []
+    for line in text.splitlines():
+        lower = line.lower()
+        if "finance lexicon" in lower:
+            continue
+        if re.match(r"^\s*[-•*]?\s*[^>]+=>\s*[^>]+", line):
+            continue
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
+
+
+def strip_wrapping_quotes(text: str) -> str:
+    stripped = text.strip()
+    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in {"'", "\""}:
+        return stripped[1:-1]
+    return text
+
+
 def translation_contains_term(translation: str, required: str) -> bool:
     required_norm = normalize_phrase(required)
     if not required_norm:
@@ -228,8 +263,14 @@ def needs_repair(source_text: str, translated_text: str) -> bool:
     translated_norm = normalize_phrase(translated_text)
     if not source_norm or not translated_norm:
         return False
-    if len(translated_norm) < max(12, int(len(source_norm) * 0.55)):
+    if len(translated_norm) < max(12, int(len(source_norm) * 0.6)):
         return True
+    source_tokens = source_norm.split()
+    translated_tokens = translated_norm.split()
+    if source_tokens and translated_tokens:
+        ratio = len(translated_tokens) / max(1, len(source_tokens))
+        if ratio < 0.65:
+            return True
     return False
 
 
@@ -271,15 +312,17 @@ def postprocess_translation(
     config: TranslationConfig,
     glossary_matches: Sequence[LexiconEntry] | None = None,
 ) -> str:
+    cleaned = strip_glossary_spillover(strip_wrapping_quotes(translated_text))
     matches = glossary_matches or []
     missing = [
         entry
         for entry in matches
-        if entry.translation and not translation_contains_term(translated_text, entry.translation)
+        if entry.translation and not translation_contains_term(cleaned, entry.translation)
     ]
-    if missing or needs_repair(source_text, translated_text):
-        return repair_translation(source_text, translated_text, config, missing or matches)
-    return translated_text
+    if missing or needs_repair(source_text, cleaned):
+        repaired = repair_translation(source_text, cleaned, config, missing or matches)
+        cleaned = strip_glossary_spillover(strip_wrapping_quotes(repaired))
+    return cleaned
 
 
 def split_whitespace(text: str) -> tuple[str, str, str]:
@@ -302,7 +345,7 @@ def build_translation_messages(
                 "You are a professional translation engine. Translate the user's text "
                 f"to {config.target_language}. Preserve meaning, punctuation, and line "
                 "breaks. Do not omit any words or sentences; translate verbatim. "
-                "The text may include placeholders like [[[RUN_0]]]. "
+                "The text may include placeholders like [[[RUN_0]]] or [[[BR]]]. "
                 "Keep all placeholders unchanged and in the same order. Only translate the "
                 "text between placeholders. Do not add commentary or quotes."
                 f"{rag_note}"
@@ -362,6 +405,7 @@ class ParagraphInfo:
     original_length: int
     is_table: bool
     slide_index: int
+    is_title: bool
 
 
 def is_numeric_text(text: str) -> bool:
@@ -469,6 +513,11 @@ def collect_paragraphs(presentation: Presentation) -> List[ParagraphInfo]:
             if should_skip_shape(shape, slide_width, slide_height, seen_keys):
                 continue
             for runs, is_table in iter_paragraph_runs(shape):
+                is_title = False
+                if shape.is_placeholder:
+                    placeholder_type = shape.placeholder_format.type
+                    if placeholder_type in {PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE, PP_PLACEHOLDER.SUBTITLE}:
+                        is_title = True
                 prefixes = []
                 cores = []
                 suffixes = []
@@ -501,6 +550,7 @@ def collect_paragraphs(presentation: Presentation) -> List[ParagraphInfo]:
                             original_length=original_length,
                             is_table=is_table,
                             slide_index=slide_index,
+                            is_title=is_title,
                         )
                     )
     return paragraphs
@@ -550,6 +600,7 @@ def collect_docx_paragraphs(document: Document) -> List[ParagraphInfo]:
                     original_length=original_length,
                     is_table=True,
                     slide_index=0,
+                    is_title=False,
                 )
             )
     return paragraphs
@@ -591,7 +642,7 @@ def translate_segments(
         "You are a professional translation engine. Translate the provided JSON segments "
         f"to {config.target_language}. Return ONLY valid JSON with the same 'segments' array. "
         "Each item must have the same 'id' and the translated 'text'. Preserve all placeholders "
-        "like [[[RUN_0]]], keep them unchanged and in the same order. "
+        "like [[[RUN_0]]] or [[[BR]]], keep them unchanged and in the same order. "
         "Do not omit any words or sentences; translate verbatim. Do not add commentary."
         f"{rag_note}"
     )
@@ -620,6 +671,18 @@ def translate_segments_cached(
 ) -> Dict[str, str]:
     segment_objs = [TranslationSegment(segment_id=seg_id, text=text) for seg_id, text in segments]
     return translate_segments(segment_objs, config, rag_context)
+
+
+def translate_text_with_postprocess(
+    source_text: str,
+    config: TranslationConfig,
+    glossary: Sequence[LexiconEntry] | None = None,
+) -> str:
+    prepared = encode_line_breaks(source_text)
+    rag_context = format_lexicon_context(glossary) if glossary else None
+    translated = cached_translate(prepared, config, rag_context)
+    translated = postprocess_translation(prepared, translated, config, glossary)
+    return decode_line_breaks(translated)
 
 
 def batch_segments(segments: Sequence[TranslationSegment], max_chars: int = 4000, max_items: int = 20):
@@ -666,7 +729,7 @@ def build_segmented_text(parts: Sequence[str]) -> str:
     chunks = []
     for idx, part in enumerate(parts):
         chunks.append(f"[[[RUN_{idx}]]]")
-        chunks.append(part)
+        chunks.append(encode_line_breaks(part))
     chunks.append("[[[RUN_END]]]")
     return "".join(chunks)
 
@@ -686,7 +749,7 @@ def split_segmented_text(text: str, count: int) -> List[str]:
         segments[int(token)] = text[start:end]
     if len(segments) != count:
         raise ValueError("Run marker count mismatch after translation.")
-    return [segments[i] for i in range(count)]
+    return [decode_line_breaks(segments[i]) for i in range(count)]
 
 
 @dataclass
@@ -718,6 +781,7 @@ def translate_paragraphs(
         paragraph_maps: List[List[int | None]] = []
         segments: List[TranslationSegment] = []
         segment_matches: Dict[str, List[LexiconEntry]] = {}
+        segment_texts: Dict[str, str] = {}
 
         for idx, paragraph in enumerate(slide_paragraphs):
             run_map: List[int | None] = []
@@ -733,6 +797,7 @@ def translate_paragraphs(
             segments.append(TranslationSegment(segment_id=segment_id, text=segmented))
             if lexicon:
                 segment_matches[segment_id] = select_lexicon_matches(segmented, lexicon)
+            segment_texts[segment_id] = segmented
             paragraph_maps.append(run_map)
 
         translated_map: Dict[str, str] = {}
@@ -769,13 +834,21 @@ def translate_paragraphs(
             try:
                 translated_parts = split_segmented_text(translated, translatable_count)
             except Exception:
-                translated_parts = []
-                for core, can_translate in zip(paragraph.cores, paragraph.translate_mask):
-                    if can_translate:
-                        glossary = select_lexicon_matches(core, lexicon) if lexicon else None
-                        rag_context = format_lexicon_context(glossary) if glossary else None
-                        translated = cached_translate(core, config, rag_context)
-                        translated_parts.append(postprocess_translation(core, translated, config, glossary))
+                original_segment = segment_texts.get(str(idx), translated)
+                repaired = repair_translation(
+                    original_segment,
+                    translated,
+                    config,
+                    segment_matches.get(str(idx), []),
+                )
+                try:
+                    translated_parts = split_segmented_text(repaired, translatable_count)
+                except Exception:
+                    translated_parts = []
+                    for core, can_translate in zip(paragraph.cores, paragraph.translate_mask):
+                        if can_translate:
+                            glossary = select_lexicon_matches(core, lexicon) if lexicon else None
+                            translated_parts.append(translate_text_with_postprocess(core, config, glossary))
 
             translated_length = 0
             for run, prefix, suffix, core, map_index, can_translate in zip(
@@ -797,9 +870,12 @@ def translate_paragraphs(
                 run.text = f"{prefix}{translated_core}{suffix}"
 
             if not paragraph.is_table and paragraph.shape is not None:
-                if paragraph.original_length and translated_length > paragraph.original_length * 1.15:
-                    text_frame = paragraph.shape.text_frame
+                text_frame = paragraph.shape.text_frame
+                if paragraph.is_title:
+                    text_frame.word_wrap = False
+                else:
                     text_frame.word_wrap = True
+                if paragraph.original_length and translated_length > paragraph.original_length * 1.05:
                     text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
             if tracker:
                 tracker.advance()
@@ -825,7 +901,10 @@ def translate_xml_text_nodes(
     if not text_nodes:
         return xml_bytes
 
-    segments = [TranslationSegment(segment_id=str(i), text=node.text or "") for i, node in enumerate(text_nodes)]
+    segments = [
+        TranslationSegment(segment_id=str(i), text=encode_line_breaks(node.text or ""))
+        for i, node in enumerate(text_nodes)
+    ]
     segment_matches: Dict[str, List[LexiconEntry]] = {}
     if lexicon:
         for seg in segments:
@@ -859,7 +938,7 @@ def translate_xml_text_nodes(
     for idx, node in enumerate(text_nodes):
         translated = translated_map.get(str(idx))
         if translated:
-            node.text = translated
+            node.text = decode_line_breaks(translated)
     output = BytesIO()
     tree.write(output, encoding="utf-8", xml_declaration=True)
     return output.getvalue()
@@ -932,9 +1011,7 @@ def translate_image_shapes(
             extracted = extract_text_from_image_ocr(shape.image.blob)
             if extracted.strip():
                 glossary = select_lexicon_matches(extracted, lexicon) if lexicon else None
-                rag_context = format_lexicon_context(glossary) if glossary else None
-                translated = cached_translate(extracted, config, rag_context)
-                translated = postprocess_translation(extracted, translated, config, glossary)
+                translated = translate_text_with_postprocess(extracted, config, glossary)
                 replace_picture_with_textbox(slide, shape, translated)
             if tracker:
                 tracker.advance()
