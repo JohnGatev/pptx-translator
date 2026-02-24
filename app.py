@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import base64
 from io import BytesIO
 from pathlib import Path
 import json
@@ -12,9 +13,11 @@ import xml.etree.ElementTree as ET
 
 import requests
 import streamlit as st
+from docx import Document
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
 from pptx.enum.text import MSO_AUTO_SIZE
+from rapidfuzz import fuzz
 
 
 DEFAULT_BASE_URL = "https://ai-research-proxy.azurewebsites.net"
@@ -22,6 +25,8 @@ DEFAULT_MODEL = "gpt-oss-120b"
 DEFAULT_TEMPERATURE = 0.2
 DEFAULT_TIMEOUT = 120
 LEXICON_PDF_NAME = "Finance 1 Lexicon ENG NL.pdf"
+FUZZY_MATCH_THRESHOLD = 88
+VISION_IMAGE_ENABLED = True
 
 
 
@@ -124,27 +129,68 @@ def tokens_with_stems(normalized_text: str) -> set[str]:
     stems = {stem_token(token) for token in tokens}
     return set(tokens) | stems
 
-def build_rag_context(texts: Iterable[str], lexicon: LexiconStore) -> str:
-    normalized_text = normalize_phrase(" ".join(texts))
-    doc_tokens = tokens_with_stems(normalized_text)
+def fuzzy_token_match(term_tokens: set[str], doc_tokens: Sequence[str], threshold: int) -> bool:
+    if not term_tokens or not doc_tokens:
+        return False
+    filtered = [token for token in term_tokens if len(token) >= 3]
+    if not filtered:
+        return False
+    for token in filtered:
+        if token in doc_tokens:
+            continue
+        best = max(fuzz.ratio(token, candidate) for candidate in doc_tokens)
+        if best < threshold:
+            return False
+    return True
 
-    matched_indices: List[int] = []
+
+def select_lexicon_matches(text: str, lexicon: LexiconStore) -> List[LexiconEntry]:
+    normalized_text = normalize_phrase(text)
+    if not normalized_text:
+        return []
+    doc_tokens_set = tokens_with_stems(normalized_text)
+    doc_tokens_list = list(doc_tokens_set) or normalized_text.split()
+    matches: List[LexiconEntry] = []
     for idx, entry in enumerate(lexicon.entries):
         term_norm = lexicon.normalized_terms[idx]
         if not term_norm:
             continue
         if term_norm in normalized_text:
-            matched_indices.append(idx)
+            matches.append(entry)
             continue
         term_tokens = lexicon.term_tokens[idx]
-        if term_tokens and term_tokens.issubset(doc_tokens):
-            matched_indices.append(idx)
+        if term_tokens and term_tokens.issubset(doc_tokens_set):
+            matches.append(entry)
+            continue
+        if FUZZY_MATCH_THRESHOLD and fuzzy_token_match(term_tokens, doc_tokens_list, FUZZY_MATCH_THRESHOLD):
+            matches.append(entry)
+    return dedupe_lexicon_matches(matches)
 
-    if not matched_indices:
+
+def dedupe_lexicon_matches(matches: Sequence[LexiconEntry]) -> List[LexiconEntry]:
+    seen = set()
+    deduped: List[LexiconEntry] = []
+    for entry in matches:
+        key = (entry.term.lower(), entry.translation.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(entry)
+    return deduped
+
+
+def merge_lexicon_matches(match_groups: Iterable[Sequence[LexiconEntry]]) -> List[LexiconEntry]:
+    combined: List[LexiconEntry] = []
+    for group in match_groups:
+        combined.extend(group)
+    return dedupe_lexicon_matches(combined)
+
+
+def format_lexicon_context(matches: Sequence[LexiconEntry]) -> str:
+    if not matches:
         return ""
     lines = []
-    for idx in matched_indices:
-        entry = lexicon.entries[idx]
+    for entry in matches:
         if entry.translation:
             lines.append(f"- {entry.term} => {entry.translation}")
         else:
@@ -162,6 +208,81 @@ def rag_instructions(rag_context: str | None) -> str:
     )
 
 
+def translation_contains_term(translation: str, required: str) -> bool:
+    required_norm = normalize_phrase(required)
+    if not required_norm:
+        return True
+    translation_norm = normalize_phrase(translation)
+    if required_norm in translation_norm:
+        return True
+    required_tokens = tokens_with_stems(required_norm)
+    translation_tokens = tokens_with_stems(translation_norm)
+    if required_tokens and required_tokens.issubset(translation_tokens):
+        return True
+    if FUZZY_MATCH_THRESHOLD and translation_tokens:
+        return fuzzy_token_match(required_tokens, list(translation_tokens), max(80, FUZZY_MATCH_THRESHOLD - 8))
+    return False
+
+
+def needs_repair(source_text: str, translated_text: str) -> bool:
+    source_norm = normalize_phrase(source_text)
+    translated_norm = normalize_phrase(translated_text)
+    if not source_norm or not translated_norm:
+        return False
+    if len(translated_norm) < max(12, int(len(source_norm) * 0.55)):
+        return True
+    return False
+
+
+def repair_translation(
+    source_text: str,
+    translated_text: str,
+    config: TranslationConfig,
+    glossary_matches: Sequence[LexiconEntry] | None = None,
+) -> str:
+    glossary_text = format_lexicon_context(glossary_matches or [])
+    glossary_note = (
+        "\n\nUse these required translations exactly when they appear in the source:\n"
+        f"{glossary_text}\n"
+        if glossary_text
+        else ""
+    )
+    system_prompt = (
+        "You are repairing a translation. Preserve every word and all placeholders "
+        "like [[[RUN_0]]], keep them unchanged and in the same order. Do not omit any text, "
+        "numbers, or punctuation. Rewrite the translation so it is complete and faithful, "
+        f"and ensure glossary terms are used exactly.{glossary_note}"
+    )
+    user_prompt = (
+        "Original text:\n"
+        f"{source_text}\n\n"
+        "Current translation:\n"
+        f"{translated_text}\n\n"
+        "Return only the corrected translation."
+    )
+    return request_chat_completion(
+        [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+        config,
+    )
+
+
+def postprocess_translation(
+    source_text: str,
+    translated_text: str,
+    config: TranslationConfig,
+    glossary_matches: Sequence[LexiconEntry] | None = None,
+) -> str:
+    matches = glossary_matches or []
+    missing = [
+        entry
+        for entry in matches
+        if entry.translation and not translation_contains_term(translated_text, entry.translation)
+    ]
+    if missing or needs_repair(source_text, translated_text):
+        return repair_translation(source_text, translated_text, config, missing or matches)
+    return translated_text
+
+
 def split_whitespace(text: str) -> tuple[str, str, str]:
     match = re.match(r"^(\s*)(.*?)(\s*)$", text, re.DOTALL)
     if not match:
@@ -173,7 +294,7 @@ def build_translation_messages(
     text: str,
     config: TranslationConfig,
     rag_context: str | None = None,
-) -> List[Dict[str, str]]:
+) -> List[Dict[str, object]]:
     rag_note = rag_instructions(rag_context)
     return [
         {
@@ -181,7 +302,8 @@ def build_translation_messages(
             "content": (
                 "You are a professional translation engine. Translate the user's text "
                 f"to {config.target_language}. Preserve meaning, punctuation, and line "
-                "breaks. The text may include placeholders like [[[RUN_0]]]. "
+                "breaks. Do not omit any words or sentences; translate verbatim. "
+                "The text may include placeholders like [[[RUN_0]]]. "
                 "Keep all placeholders unchanged and in the same order. Only translate the "
                 "text between placeholders. Do not add commentary or quotes."
                 f"{rag_note}"
@@ -191,7 +313,7 @@ def build_translation_messages(
     ]
 
 
-def request_chat_completion(messages: List[Dict[str, str]], config: TranslationConfig) -> str:
+def request_chat_completion(messages: List[Dict[str, object]], config: TranslationConfig) -> str:
     base_url = normalize_base_url(config.base_url)
     payload = {
         "model": config.model,
@@ -385,6 +507,55 @@ def collect_paragraphs(presentation: Presentation) -> List[ParagraphInfo]:
     return paragraphs
 
 
+def iter_docx_paragraph_runs(document: Document) -> Iterable[Tuple[List, bool]]:
+    for paragraph in document.paragraphs:
+        if paragraph.runs:
+            yield list(paragraph.runs), False
+    for table in document.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    if paragraph.runs:
+                        yield list(paragraph.runs), True
+
+
+def collect_docx_paragraphs(document: Document) -> List[ParagraphInfo]:
+    paragraphs: List[ParagraphInfo] = []
+    for runs, is_table in iter_docx_paragraph_runs(document):
+        prefixes = []
+        cores = []
+        suffixes = []
+        translate_mask = []
+        original_length = 0
+        for run in runs:
+            prefix, core, suffix = split_whitespace(run.text or "")
+            can_translate = bool(core)
+            if core:
+                if is_math_text(core) or is_numeric_text(core):
+                    can_translate = False
+            prefixes.append(prefix)
+            cores.append(core)
+            suffixes.append(suffix)
+            translate_mask.append(can_translate)
+            if can_translate:
+                original_length += len(core)
+        if any(translate_mask):
+            paragraphs.append(
+                ParagraphInfo(
+                    runs=runs,
+                    prefixes=prefixes,
+                    cores=cores,
+                    suffixes=suffixes,
+                    translate_mask=translate_mask,
+                    shape=None,
+                    original_length=original_length,
+                    is_table=True,
+                    slide_index=0,
+                )
+            )
+    return paragraphs
+
+
 def build_segments_json(segments: Sequence[TranslationSegment]) -> str:
     payload = {"segments": [{"id": seg.segment_id, "text": seg.text} for seg in segments]}
     return json.dumps(payload, ensure_ascii=False)
@@ -422,7 +593,7 @@ def translate_segments(
         f"to {config.target_language}. Return ONLY valid JSON with the same 'segments' array. "
         "Each item must have the same 'id' and the translated 'text'. Preserve all placeholders "
         "like [[[RUN_0]]], keep them unchanged and in the same order. "
-        "Do not add commentary."
+        "Do not omit any words or sentences; translate verbatim. Do not add commentary."
         f"{rag_note}"
     )
     messages = [
@@ -547,6 +718,7 @@ def translate_paragraphs(
         slide_paragraphs = grouped[slide_index]
         paragraph_maps: List[List[int | None]] = []
         segments: List[TranslationSegment] = []
+        segment_matches: Dict[str, List[LexiconEntry]] = {}
 
         for idx, paragraph in enumerate(slide_paragraphs):
             run_map: List[int | None] = []
@@ -558,18 +730,38 @@ def translate_paragraphs(
                 else:
                     run_map.append(None)
             segmented = build_segmented_text(translatable_cores)
-            segments.append(TranslationSegment(segment_id=str(idx), text=segmented))
+            segment_id = str(idx)
+            segments.append(TranslationSegment(segment_id=segment_id, text=segmented))
+            if lexicon:
+                segment_matches[segment_id] = select_lexicon_matches(segmented, lexicon)
             paragraph_maps.append(run_map)
 
         translated_map: Dict[str, str] = {}
         for batch in batch_segments(segments, max_chars=max_chars, max_items=max_items):
             batch_key = tuple((seg.segment_id, seg.text) for seg in batch)
-            rag_context = build_rag_context([seg.text for seg in batch], lexicon) if lexicon else None
+            rag_context = (
+                format_lexicon_context(
+                    merge_lexicon_matches(segment_matches.get(seg.segment_id, []) for seg in batch)
+                )
+                if lexicon
+                else None
+            )
             try:
                 translated_map.update(translate_segments_cached(batch_key, config, rag_context))
             except Exception:
                 for seg in batch:
-                    translated_map[seg.segment_id] = cached_translate(seg.text, config, rag_context)
+                    seg_context = (
+                        format_lexicon_context(segment_matches.get(seg.segment_id, [])) if lexicon else None
+                    )
+                    translated_map[seg.segment_id] = cached_translate(seg.text, config, seg_context)
+            for seg in batch:
+                if seg.segment_id in translated_map:
+                    translated_map[seg.segment_id] = postprocess_translation(
+                        seg.text,
+                        translated_map[seg.segment_id],
+                        config,
+                        segment_matches.get(seg.segment_id),
+                    )
 
         for idx, paragraph in enumerate(slide_paragraphs):
             translated = translated_map.get(str(idx), "")
@@ -581,7 +773,10 @@ def translate_paragraphs(
                 translated_parts = []
                 for core, can_translate in zip(paragraph.cores, paragraph.translate_mask):
                     if can_translate:
-                        translated_parts.append(cached_translate(core, config))
+                        glossary = select_lexicon_matches(core, lexicon) if lexicon else None
+                        rag_context = format_lexicon_context(glossary) if glossary else None
+                        translated = cached_translate(core, config, rag_context)
+                        translated_parts.append(postprocess_translation(core, translated, config, glossary))
 
             translated_length = 0
             for run, prefix, suffix, core, map_index, can_translate in zip(
@@ -602,7 +797,7 @@ def translate_paragraphs(
                 translated_length += len(translated_core)
                 run.text = f"{prefix}{translated_core}{suffix}"
 
-            if not paragraph.is_table:
+            if not paragraph.is_table and paragraph.shape is not None:
                 if paragraph.original_length and translated_length > paragraph.original_length * 1.15:
                     text_frame = paragraph.shape.text_frame
                     text_frame.word_wrap = True
@@ -632,16 +827,35 @@ def translate_xml_text_nodes(
         return xml_bytes
 
     segments = [TranslationSegment(segment_id=str(i), text=node.text or "") for i, node in enumerate(text_nodes)]
+    segment_matches: Dict[str, List[LexiconEntry]] = {}
+    if lexicon:
+        for seg in segments:
+            segment_matches[seg.segment_id] = select_lexicon_matches(seg.text, lexicon)
     translated_map: Dict[str, str] = {}
     max_chars, max_items = batch_limits()
     for batch in batch_segments(segments, max_chars=max_chars, max_items=max_items):
         batch_key = tuple((seg.segment_id, seg.text) for seg in batch)
-        rag_context = build_rag_context([seg.text for seg in batch], lexicon) if lexicon else None
+        rag_context = (
+            format_lexicon_context(merge_lexicon_matches(segment_matches.get(seg.segment_id, []) for seg in batch))
+            if lexicon
+            else None
+        )
         try:
             translated_map.update(translate_segments_cached(batch_key, config, rag_context))
         except Exception:
             for seg in batch:
-                translated_map[seg.segment_id] = cached_translate(seg.text, config, rag_context)
+                seg_context = (
+                    format_lexicon_context(segment_matches.get(seg.segment_id, [])) if lexicon else None
+                )
+                translated_map[seg.segment_id] = cached_translate(seg.text, config, seg_context)
+        for seg in batch:
+            if seg.segment_id in translated_map:
+                translated_map[seg.segment_id] = postprocess_translation(
+                    seg.text,
+                    translated_map[seg.segment_id],
+                    config,
+                    segment_matches.get(seg.segment_id),
+                )
 
     for idx, node in enumerate(text_nodes):
         translated = translated_map.get(str(idx))
@@ -650,6 +864,79 @@ def translate_xml_text_nodes(
     output = BytesIO()
     tree.write(output, encoding="utf-8", xml_declaration=True)
     return output.getvalue()
+
+
+def supports_vision_model(model: str) -> bool:
+    model_name = model.lower()
+    vision_hints = ("vision", "gpt-4o", "gpt-4.1", "gpt-4-turbo")
+    return any(hint in model_name for hint in vision_hints)
+
+
+def extract_text_from_image(image_bytes: bytes, config: TranslationConfig) -> str:
+    if not VISION_IMAGE_ENABLED:
+        return ""
+    if not supports_vision_model(config.model):
+        return ""
+    encoded = base64.b64encode(image_bytes).decode("utf-8")
+    system_prompt = (
+        "You read text from images. Extract all visible text exactly as it appears, "
+        "preserving line breaks. Return only the extracted text."
+    )
+    user_content = [
+        {"type": "text", "text": "Extract the text exactly as shown."},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}},
+    ]
+    try:
+        return request_chat_completion(
+            [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}],
+            config,
+        )
+    except Exception:
+        return ""
+
+
+def replace_picture_with_textbox(slide, shape, text: str) -> None:
+    left, top, width, height = shape.left, shape.top, shape.width, shape.height
+    parent = shape.element.getparent()
+    if parent is not None:
+        parent.remove(shape.element)
+    textbox = slide.shapes.add_textbox(left, top, width, height)
+    textbox.name = "IMAGE_TEXT_TRANSLATED"
+    text_frame = textbox.text_frame
+    text_frame.word_wrap = True
+    text_frame.text = text
+    text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+
+
+def count_picture_shapes(presentation: Presentation) -> int:
+    count = 0
+    for slide in presentation.slides:
+        for shape in iter_slide_shapes(slide.shapes):
+            if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                count += 1
+    return count
+
+
+def translate_image_shapes(
+    presentation: Presentation,
+    config: TranslationConfig,
+    lexicon: LexiconStore | None = None,
+    tracker: ProgressTracker | None = None,
+) -> None:
+    if not VISION_IMAGE_ENABLED or not supports_vision_model(config.model):
+        return
+    for slide in presentation.slides:
+        shapes = [shape for shape in iter_slide_shapes(slide.shapes) if shape.shape_type == MSO_SHAPE_TYPE.PICTURE]
+        for shape in shapes:
+            extracted = extract_text_from_image(shape.image.blob, config)
+            if extracted.strip():
+                glossary = select_lexicon_matches(extracted, lexicon) if lexicon else None
+                rag_context = format_lexicon_context(glossary) if glossary else None
+                translated = cached_translate(extracted, config, rag_context)
+                translated = postprocess_translation(extracted, translated, config, glossary)
+                replace_picture_with_textbox(slide, shape, translated)
+            if tracker:
+                tracker.advance()
 
 
 def count_xml_parts(pptx_bytes: bytes) -> int:
@@ -779,12 +1066,12 @@ def main() -> None:
         api_key = st.text_input("API key", type="password")
         st.caption("Uses LiteLLM endpoint with model gpt-oss-120b.")
 
-    uploaded_file = st.file_uploader("Drop your PPTX file here", type=["pptx"])
+    uploaded_file = st.file_uploader("Drop your PPTX or DOCX file here", type=["pptx", "docx"])
     if not uploaded_file:
         st.markdown(
             "<div style='border:1px solid #a8a29f; border-left:4px solid #bc0031; "
             "padding:12px; background:#ffffff; color:#1B1918;'>"
-            "Upload a .pptx file to get started."
+            "Upload a .pptx or .docx file to get started."
             "</div>",
             unsafe_allow_html=True,
         )
@@ -811,17 +1098,20 @@ def main() -> None:
     file_id = f"{uploaded_file.name}:{uploaded_file.size}"
     if st.session_state.get("file_id") != file_id:
         st.session_state["file_id"] = file_id
-        st.session_state.pop("translated_pptx", None)
+        st.session_state.pop("translated_file", None)
+        st.session_state.pop("translated_name", None)
+        st.session_state.pop("translated_mime", None)
+        st.session_state.pop("translated_label", None)
 
     action_col, download_col, _spacer = st.columns([1, 1, 6], gap="small")
     translate_clicked = action_col.button("Translate Deck", type="primary")
     download_placeholder = download_col.empty()
-    if "translated_pptx" in st.session_state:
+    if "translated_file" in st.session_state:
         download_placeholder.download_button(
-            "Download PPTX",
-            data=st.session_state["translated_pptx"],
-            file_name=f"{uploaded_file.name.rsplit('.', 1)[0]}_{target_language}.pptx",
-            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            st.session_state.get("translated_label", "Download File"),
+            data=st.session_state["translated_file"],
+            file_name=st.session_state.get("translated_name", uploaded_file.name),
+            mime=st.session_state.get("translated_mime", "application/octet-stream"),
         )
     if translate_clicked:
         if not config.api_key:
@@ -832,56 +1122,123 @@ def main() -> None:
             set_status(st.empty(), "The uploaded file was empty.")
             return
 
-        presentation = Presentation(BytesIO(raw_bytes))
-        paragraphs = collect_paragraphs(presentation)
-
-        if not paragraphs:
-            set_status(st.empty(), "No translatable paragraphs were found in this deck.")
-            return
-
-        xml_count = count_xml_parts(raw_bytes)
-        total_steps = len(paragraphs) + xml_count
-        if total_steps == 0:
-            total_steps = 1
-
+        file_suffix = Path(uploaded_file.name).suffix.lower()
         progress_container = st.empty()
         status_text = st.empty()
-        render_progress(progress_container, 0.0)
-        tracker = ProgressTracker(total=total_steps, container=progress_container)
-        start_time = time.time()
 
-        try:
-            set_status(status_text, "Translating text…")
-            translate_paragraphs(paragraphs, config, tracker=tracker, lexicon=lexicon_store)
-        except requests.RequestException as exc:
-            set_status(st.empty(), f"Translation request failed: {exc}")
+        if file_suffix == ".pptx":
+            presentation = Presentation(BytesIO(raw_bytes))
+            paragraphs = collect_paragraphs(presentation)
+
+            if not paragraphs:
+                set_status(st.empty(), "No translatable paragraphs were found in this deck.")
+                return
+
+            xml_count = count_xml_parts(raw_bytes)
+            raw_image_count = count_picture_shapes(presentation)
+            use_vision = VISION_IMAGE_ENABLED and supports_vision_model(config.model)
+            image_count = raw_image_count if use_vision else 0
+            total_steps = len(paragraphs) + xml_count + image_count
+            if total_steps == 0:
+                total_steps = 1
+
+            render_progress(progress_container, 0.0)
+            tracker = ProgressTracker(total=total_steps, container=progress_container)
+            start_time = time.time()
+
+            try:
+                set_status(status_text, "Translating text…")
+                translate_paragraphs(paragraphs, config, tracker=tracker, lexicon=lexicon_store)
+            except requests.RequestException as exc:
+                set_status(st.empty(), f"Translation request failed: {exc}")
+                return
+            except RuntimeError as exc:
+                set_status(st.empty(), str(exc))
+                return
+            except Exception as exc:
+                set_status(st.empty(), f"Translation failed: {exc}")
+                return
+
+            if image_count:
+                set_status(status_text, "Translating image text…")
+                translate_image_shapes(presentation, config, lexicon=lexicon_store, tracker=tracker)
+
+            output = BytesIO()
+            presentation.save(output)
+            pptx_bytes = output.getvalue()
+            if xml_count:
+                set_status(status_text, "Translating chart/SmartArt text…")
+            pptx_bytes = translate_xml_parts(pptx_bytes, config, tracker=tracker, lexicon=lexicon_store)
+            output = BytesIO(pptx_bytes)
+            output.seek(0)
+
+            render_progress(progress_container, 1.0)
+
+            elapsed = time.time() - start_time
+            set_status(status_text, f"Translation complete in {elapsed:.1f}s.")
+
+            st.session_state["translated_file"] = output.getvalue()
+            st.session_state["translated_name"] = (
+                f"{uploaded_file.name.rsplit('.', 1)[0]}_{target_language}.pptx"
+            )
+            st.session_state["translated_mime"] = (
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            )
+            st.session_state["translated_label"] = "Download PPTX"
+        elif file_suffix == ".docx":
+            document = Document(BytesIO(raw_bytes))
+            paragraphs = collect_docx_paragraphs(document)
+            if not paragraphs:
+                set_status(st.empty(), "No translatable paragraphs were found in this document.")
+                return
+
+            total_steps = len(paragraphs)
+            if total_steps == 0:
+                total_steps = 1
+
+            render_progress(progress_container, 0.0)
+            tracker = ProgressTracker(total=total_steps, container=progress_container)
+            start_time = time.time()
+
+            try:
+                set_status(status_text, "Translating text…")
+                translate_paragraphs(paragraphs, config, tracker=tracker, lexicon=lexicon_store)
+            except requests.RequestException as exc:
+                set_status(st.empty(), f"Translation request failed: {exc}")
+                return
+            except RuntimeError as exc:
+                set_status(st.empty(), str(exc))
+                return
+            except Exception as exc:
+                set_status(st.empty(), f"Translation failed: {exc}")
+                return
+
+            output = BytesIO()
+            document.save(output)
+            output.seek(0)
+
+            render_progress(progress_container, 1.0)
+
+            elapsed = time.time() - start_time
+            set_status(status_text, f"Translation complete in {elapsed:.1f}s.")
+
+            st.session_state["translated_file"] = output.getvalue()
+            st.session_state["translated_name"] = (
+                f"{uploaded_file.name.rsplit('.', 1)[0]}_{target_language}.docx"
+            )
+            st.session_state["translated_mime"] = (
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
+            st.session_state["translated_label"] = "Download DOCX"
+        else:
+            set_status(st.empty(), "Unsupported file type. Please upload a PPTX or DOCX file.")
             return
-        except RuntimeError as exc:
-            set_status(st.empty(), str(exc))
-            return
-        except Exception as exc:
-            set_status(st.empty(), f"Translation failed: {exc}")
-            return
-        output = BytesIO()
-        presentation.save(output)
-        pptx_bytes = output.getvalue()
-        if xml_count:
-            set_status(status_text, "Translating chart/SmartArt text…")
-        pptx_bytes = translate_xml_parts(pptx_bytes, config, tracker=tracker, lexicon=lexicon_store)
-        output = BytesIO(pptx_bytes)
-        output.seek(0)
 
-        render_progress(progress_container, 1.0)
-
-        elapsed = time.time() - start_time
-        set_status(status_text, f"Translation complete in {elapsed:.1f}s.")
-
-        st.session_state["translated_pptx"] = output.getvalue()
         download_placeholder.download_button(
-            "Download PPTX",
-            data=st.session_state["translated_pptx"],
-            file_name=f"{uploaded_file.name.rsplit('.', 1)[0]}_{target_language}.pptx",
-            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            st.session_state.get("translated_label", "Download File"),
+            data=st.session_state["translated_file"],
+            file_name=st.session_state["translated_name"],
+            mime=st.session_state["translated_mime"],
         )
 
 if __name__ == "__main__":

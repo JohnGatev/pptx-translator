@@ -1,6 +1,6 @@
 # PPTX Translator
 
-Translate PowerPoint decks slide-by-slide using a LiteLLM/OpenAI-compatible endpoint while keeping the original layout intact.
+Translate PowerPoint decks and Word documents using a LiteLLM/OpenAI-compatible endpoint while keeping the original layout intact.
 
 ## Setup
 
@@ -18,14 +18,16 @@ streamlit run app.py
 
 ## Notes
 
-- Paragraphs are translated in batches, then written back to runs to preserve formatting.
-- Charts and SmartArt text are translated by editing OOXML after save.
+- PPTX and DOCX paragraphs are translated in batches, then written back to runs to preserve formatting.
+- PPTX charts and SmartArt text are translated by editing OOXML after save.
 - Some embedded objects (OLE/math) remain unchanged.
 - Provide your API key in the sidebar before translating.
+- Image text translation requires a vision-capable model; text-only models skip image processing.
 
 ## Finance lexicon RAG (required)
 
 Place the PDF lexicon file `Finance 1 Lexicon ENG NL.pdf` in the project root. The app builds a lightweight RAG index from this PDF and injects the most relevant entries into each translation call as context, so the model can apply the terms contextually (including variations and grammar).
+The matcher scans the full lexicon per batch and uses fuzzy/token matching plus a repair pass to enforce glossary usage.
 
 ## Deploy (Streamlit Community Cloud)
 
