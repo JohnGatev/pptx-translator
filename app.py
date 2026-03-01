@@ -274,6 +274,33 @@ def needs_repair(source_text: str, translated_text: str) -> bool:
     return False
 
 
+def source_leak_detected(source_text: str, translated_text: str) -> bool:
+    source_norm = normalize_phrase(source_text)
+    translated_norm = normalize_phrase(translated_text)
+    if not source_norm or not translated_norm:
+        return False
+    if len(source_norm) > 12 and source_norm in translated_norm:
+        return True
+    source_tokens = source_norm.split()
+    translated_tokens = translated_norm.split()
+    if len(source_tokens) < 4:
+        return False
+    overlap = sum(1 for token in source_tokens if token in translated_tokens)
+    if overlap / len(source_tokens) > 0.6:
+        return True
+    return False
+
+
+def should_retry_core(source_text: str, translated_text: str) -> bool:
+    if not translated_text.strip():
+        return True
+    if needs_repair(source_text, translated_text):
+        return True
+    if source_leak_detected(source_text, translated_text):
+        return True
+    return False
+
+
 def repair_translation(
     source_text: str,
     translated_text: str,
@@ -437,7 +464,7 @@ def is_off_canvas(shape, slide_width: int, slide_height: int) -> bool:
     return right < 0 or bottom < 0 or left > slide_width or top > slide_height
 
 
-def should_skip_shape(shape, slide_width: int, slide_height: int, seen_keys: set) -> bool:
+def should_skip_shape(shape, slide_width: int, slide_height: int) -> bool:
     if getattr(shape, "visible", True) is False:
         return True
     if is_off_canvas(shape, slide_width, slide_height):
@@ -450,17 +477,6 @@ def should_skip_shape(shape, slide_width: int, slide_height: int, seen_keys: set
             PP_PLACEHOLDER.SLIDE_NUMBER,
         }:
             return True
-    text = extract_shape_text(shape)
-    if not text.strip():
-        return False
-    left = int(getattr(shape, "left", 0))
-    top = int(getattr(shape, "top", 0))
-    width = int(getattr(shape, "width", 0))
-    height = int(getattr(shape, "height", 0))
-    key = (left, top, width, height, text.strip())
-    if key in seen_keys:
-        return True
-    seen_keys.add(key)
     return False
 
 
@@ -494,6 +510,12 @@ def iter_paragraph_runs(shape) -> Iterable[Tuple[List, bool]]:
         for paragraph in shape.text_frame.paragraphs:
             if paragraph.runs:
                 yield list(paragraph.runs), False
+            elif paragraph.text:
+                text = paragraph.text
+                paragraph.text = ""
+                run = paragraph.add_run()
+                run.text = text
+                yield [run], False
 
     if shape.has_table:
         for row in shape.table.rows:
@@ -501,6 +523,12 @@ def iter_paragraph_runs(shape) -> Iterable[Tuple[List, bool]]:
                 for paragraph in cell.text_frame.paragraphs:
                     if paragraph.runs:
                         yield list(paragraph.runs), True
+                    elif paragraph.text:
+                        text = paragraph.text
+                        paragraph.text = ""
+                        run = paragraph.add_run()
+                        run.text = text
+                        yield [run], True
 
 
 def collect_paragraphs(presentation: Presentation) -> List[ParagraphInfo]:
@@ -508,9 +536,8 @@ def collect_paragraphs(presentation: Presentation) -> List[ParagraphInfo]:
     slide_width = presentation.slide_width
     slide_height = presentation.slide_height
     for slide_index, slide in enumerate(presentation.slides):
-        seen_keys: set = set()
         for shape in iter_slide_shapes(slide.shapes):
-            if should_skip_shape(shape, slide_width, slide_height, seen_keys):
+            if should_skip_shape(shape, slide_width, slide_height):
                 continue
             for runs, is_table in iter_paragraph_runs(shape):
                 is_title = False
@@ -560,12 +587,22 @@ def iter_docx_paragraph_runs(document: Document) -> Iterable[Tuple[List, bool]]:
     for paragraph in document.paragraphs:
         if paragraph.runs:
             yield list(paragraph.runs), False
+        elif paragraph.text:
+            text = paragraph.text
+            paragraph.text = ""
+            run = paragraph.add_run(text)
+            yield [run], False
     for table in document.tables:
         for row in table.rows:
             for cell in row.cells:
                 for paragraph in cell.paragraphs:
                     if paragraph.runs:
                         yield list(paragraph.runs), True
+                    elif paragraph.text:
+                        text = paragraph.text
+                        paragraph.text = ""
+                        run = paragraph.add_run(text)
+                        yield [run], True
 
 
 def collect_docx_paragraphs(document: Document) -> List[ParagraphInfo]:
@@ -866,6 +903,9 @@ def translate_paragraphs(
                     translated_core = translated_parts[map_index]
                 else:
                     translated_core = core
+                if should_retry_core(core, translated_core):
+                    glossary = select_lexicon_matches(core, lexicon) if lexicon else None
+                    translated_core = translate_text_with_postprocess(core, config, glossary)
                 translated_length += len(translated_core)
                 run.text = f"{prefix}{translated_core}{suffix}"
 
