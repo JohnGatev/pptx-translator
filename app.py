@@ -27,6 +27,7 @@ LEXICON_PDF_NAME = "Finance 1 Lexicon ENG NL.pdf"
 FUZZY_MATCH_THRESHOLD = 88
 OCR_IMAGE_ENABLED = True
 LINE_BREAK_TOKEN = "[[[BR]]]"
+MAX_LEXICON_MATCHES = 12
 
 
 
@@ -52,6 +53,7 @@ class LexiconStore:
     entries: List[LexiconEntry]
     normalized_terms: List[str]
     term_tokens: List[set[str]]
+    normalized_translations: List[str]
 
 
 def normalize_base_url(base_url: str) -> str:
@@ -74,6 +76,7 @@ def load_finance_lexicon() -> LexiconStore | None:
         lines.extend(text.splitlines())
 
     entries: List[LexiconEntry] = []
+    seen_pairs: set[tuple[str, str]] = set()
     for raw_line in lines:
         line = raw_line.strip()
         if not line:
@@ -89,10 +92,16 @@ def load_finance_lexicon() -> LexiconStore | None:
             english = parts[0].strip()
             dutch = parts[1].strip()
             if english and dutch:
+                if len(english.split()) > 10 or len(dutch.split()) > 12:
+                    continue
+                if len(english) > 120 or len(dutch) > 140:
+                    continue
+                pair_key = (english.lower(), dutch.lower())
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
                 raw = f"{english} => {dutch}"
                 entries.append(LexiconEntry(term=english, translation=dutch, raw=raw))
-        else:
-            entries.append(LexiconEntry(term=line, translation="", raw=line))
 
     if not entries:
         return None
@@ -102,11 +111,18 @@ def load_finance_lexicon() -> LexiconStore | None:
 def build_lexicon_store(entries: List[LexiconEntry]) -> LexiconStore:
     normalized_terms: List[str] = []
     term_tokens: List[set[str]] = []
+    normalized_translations: List[str] = []
     for entry in entries:
         normalized = normalize_phrase(entry.term)
         normalized_terms.append(normalized)
         term_tokens.append(tokens_with_stems(normalized))
-    return LexiconStore(entries=entries, normalized_terms=normalized_terms, term_tokens=term_tokens)
+        normalized_translations.append(normalize_phrase(entry.translation))
+    return LexiconStore(
+        entries=entries,
+        normalized_terms=normalized_terms,
+        term_tokens=term_tokens,
+        normalized_translations=normalized_translations,
+    )
 
 
 def normalize_phrase(text: str) -> str:
@@ -145,7 +161,7 @@ def decode_line_breaks(text: str) -> str:
 def fuzzy_token_match(term_tokens: set[str], doc_tokens: Sequence[str], threshold: int) -> bool:
     if not term_tokens or not doc_tokens:
         return False
-    filtered = [token for token in term_tokens if len(token) >= 3]
+    filtered = [token for token in term_tokens if len(token) >= 5]
     if not filtered:
         return False
     for token in filtered:
@@ -163,21 +179,30 @@ def select_lexicon_matches(text: str, lexicon: LexiconStore) -> List[LexiconEntr
         return []
     doc_tokens_set = tokens_with_stems(normalized_text)
     doc_tokens_list = list(doc_tokens_set) or normalized_text.split()
-    matches: List[LexiconEntry] = []
+    matches: List[tuple[int, LexiconEntry]] = []
     for idx, entry in enumerate(lexicon.entries):
         term_norm = lexicon.normalized_terms[idx]
         if not term_norm:
             continue
+        score = 0
         if term_norm in normalized_text:
-            matches.append(entry)
-            continue
+            score += 6
         term_tokens = lexicon.term_tokens[idx]
         if term_tokens and term_tokens.issubset(doc_tokens_set):
-            matches.append(entry)
+            score += 4
+        if score == 0 and FUZZY_MATCH_THRESHOLD and len(term_tokens) > 1:
+            if fuzzy_token_match(term_tokens, doc_tokens_list, FUZZY_MATCH_THRESHOLD + 4):
+                score += 2
+        if score == 0:
             continue
-        if FUZZY_MATCH_THRESHOLD and fuzzy_token_match(term_tokens, doc_tokens_list, FUZZY_MATCH_THRESHOLD):
-            matches.append(entry)
-    return dedupe_lexicon_matches(matches)
+        if len(term_tokens) == 1 and next(iter(term_tokens), "") in {"value", "statement", "market", "profit", "loss"}:
+            score -= 2
+        if score > 0:
+            matches.append((score, entry))
+
+    matches.sort(key=lambda item: item[0], reverse=True)
+    selected = [entry for _, entry in matches[:MAX_LEXICON_MATCHES]]
+    return dedupe_lexicon_matches(selected)
 
 
 def dedupe_lexicon_matches(matches: Sequence[LexiconEntry]) -> List[LexiconEntry]:
@@ -216,7 +241,8 @@ def rag_instructions(rag_context: str | None) -> str:
         return ""
     return (
         "\n\nFinance lexicon context. Use these preferred translations when relevant "
-        "(including close variations). Do not output this list:\n"
+        "(including close variations). Only apply a term if that English term is present "
+        "in the source text. Never output this list or any glossary entries directly:\n"
         f"{rag_context}\n"
     )
 
@@ -240,6 +266,30 @@ def strip_wrapping_quotes(text: str) -> str:
     if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in {"'", "\""}:
         return stripped[1:-1]
     return text
+
+
+def contains_glossary_dump(
+    source_text: str,
+    translated_text: str,
+    lexicon_matches: Sequence[LexiconEntry] | None = None,
+) -> bool:
+    if not lexicon_matches:
+        return False
+    source_norm = normalize_phrase(source_text)
+    translated_norm = normalize_phrase(translated_text)
+    if not translated_norm:
+        return False
+    leaked = 0
+    for entry in lexicon_matches:
+        term_norm = normalize_phrase(entry.term)
+        trans_norm = normalize_phrase(entry.translation)
+        if not term_norm or not trans_norm:
+            continue
+        in_source = term_norm in source_norm or trans_norm in source_norm
+        in_translation = term_norm in translated_norm or trans_norm in translated_norm
+        if in_translation and not in_source:
+            leaked += 1
+    return leaked >= 3
 
 
 def translation_contains_term(translation: str, required: str) -> bool:
@@ -341,6 +391,9 @@ def postprocess_translation(
 ) -> str:
     cleaned = strip_glossary_spillover(strip_wrapping_quotes(translated_text))
     matches = glossary_matches or []
+    if contains_glossary_dump(source_text, cleaned, matches):
+        cleaned = repair_translation(source_text, cleaned, config, [])
+        cleaned = strip_glossary_spillover(strip_wrapping_quotes(cleaned))
     missing = [
         entry
         for entry in matches
@@ -433,6 +486,8 @@ class ParagraphInfo:
     is_table: bool
     slide_index: int
     is_title: bool
+    shape_word_wrap: bool | None
+    shape_auto_size: object | None
 
 
 def is_numeric_text(text: str) -> bool:
@@ -541,6 +596,11 @@ def collect_paragraphs(presentation: Presentation) -> List[ParagraphInfo]:
                 continue
             for runs, is_table in iter_paragraph_runs(shape):
                 is_title = False
+                shape_word_wrap = None
+                shape_auto_size = None
+                if shape.has_text_frame:
+                    shape_word_wrap = shape.text_frame.word_wrap
+                    shape_auto_size = shape.text_frame.auto_size
                 if shape.is_placeholder:
                     placeholder_type = shape.placeholder_format.type
                     if placeholder_type in {PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE, PP_PLACEHOLDER.SUBTITLE}:
@@ -578,6 +638,8 @@ def collect_paragraphs(presentation: Presentation) -> List[ParagraphInfo]:
                             is_table=is_table,
                             slide_index=slide_index,
                             is_title=is_title,
+                            shape_word_wrap=shape_word_wrap,
+                            shape_auto_size=shape_auto_size,
                         )
                     )
     return paragraphs
@@ -638,6 +700,8 @@ def collect_docx_paragraphs(document: Document) -> List[ParagraphInfo]:
                     is_table=True,
                     slide_index=0,
                     is_title=False,
+                    shape_word_wrap=None,
+                    shape_auto_size=None,
                 )
             )
     return paragraphs
@@ -738,7 +802,7 @@ def batch_segments(segments: Sequence[TranslationSegment], max_chars: int = 4000
 
 
 def batch_limits() -> Tuple[int, int]:
-    return 30000, 120
+    return 8000, 28
 
 
 def count_translation_batches(paragraphs: List[ParagraphInfo]) -> int:
@@ -911,11 +975,12 @@ def translate_paragraphs(
 
             if not paragraph.is_table and paragraph.shape is not None:
                 text_frame = paragraph.shape.text_frame
-                if paragraph.is_title:
-                    text_frame.word_wrap = False
-                else:
+                if paragraph.shape_word_wrap is not None:
+                    text_frame.word_wrap = paragraph.shape_word_wrap
+                if paragraph.shape_auto_size is not None:
+                    text_frame.auto_size = paragraph.shape_auto_size
+                if paragraph.original_length and translated_length > paragraph.original_length * 1.2:
                     text_frame.word_wrap = True
-                if paragraph.original_length and translated_length > paragraph.original_length * 1.05:
                     text_frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
             if tracker:
                 tracker.advance()
