@@ -367,7 +367,8 @@ def repair_translation(
     system_prompt = (
         "You are repairing a translation. Preserve every word and all placeholders "
         "like [[[RUN_0]]], keep them unchanged and in the same order. Do not omit any text, "
-        "numbers, or punctuation. Rewrite the translation so it is complete and faithful, "
+        "numbers, or punctuation. Keep numbers, currencies, and equation fragments unchanged. "
+        "Rewrite the translation so it is complete and faithful, "
         f"and ensure glossary terms are used exactly.{glossary_note}"
     )
     user_prompt = (
@@ -426,6 +427,7 @@ def build_translation_messages(
                 f"to {config.target_language}. Preserve meaning, punctuation, and line "
                 "breaks. Do not omit any words or sentences; translate verbatim. "
                 "The text may include placeholders like [[[RUN_0]]] or [[[BR]]]. "
+                "Keep numbers, currencies, and equation fragments unchanged. "
                 "Keep all placeholders unchanged and in the same order. Only translate the "
                 "text between placeholders. Do not add commentary or quotes."
                 f"{rag_note}"
@@ -498,11 +500,18 @@ def is_math_text(text: str) -> bool:
     if not text:
         return False
     math_symbols = set("=<>±√∑∫∏≈≠≤≥→←⇒⇔∞πσΔΩβμτ")
-    if any(symbol in text for symbol in math_symbols):
+    has_math_symbol = any(symbol in text for symbol in math_symbols)
+    letter_count = len(re.findall(r"[A-Za-zÀ-ÿ]", text))
+    digit_count = len(re.findall(r"\d", text))
+
+    # Treat as math only when the run is formula-dominant.
+    if has_math_symbol and letter_count <= 6 and digit_count > 0:
         return True
-    if re.search(r"[A-Za-z]\s*=\s*[\d]", text):
+    if re.search(r"^\s*[A-Za-z]?\s*=\s*[\d(]", text):
         return True
-    if re.search(r"[A-Za-z]\s*[_^]", text):
+    if re.search(r"^[\s\d.,:%€$£¥+\-*/=()]+$", text):
+        return True
+    if re.search(r"[A-Za-z]\s*[_^]\s*[A-Za-z0-9]", text) and letter_count <= 8:
         return True
     return False
 
@@ -744,6 +753,7 @@ def translate_segments(
         f"to {config.target_language}. Return ONLY valid JSON with the same 'segments' array. "
         "Each item must have the same 'id' and the translated 'text'. Preserve all placeholders "
         "like [[[RUN_0]]] or [[[BR]]], keep them unchanged and in the same order. "
+        "Keep numbers, currencies, and equation fragments unchanged. "
         "Do not omit any words or sentences; translate verbatim. Do not add commentary."
         f"{rag_note}"
     )
